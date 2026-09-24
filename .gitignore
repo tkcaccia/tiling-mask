@@ -1,0 +1,11 @@
+__pycache__/
+.DS_Store
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+cpp/build/
+output/
+benchmark_results_*/
