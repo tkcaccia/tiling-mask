@@ -70,3 +70,20 @@ def test_end_to_end_pixel_and_tile_masks(tmp_path):
         assert source.shape == (2, 3)
         assert source.count == 1
         assert source.colormap(1)[1] != source.colormap(1)[2]
+
+    noisy_output = tmp_path / "noisy_output"
+    noisy_metrics = build_masks(
+        image, annotations, [TileSize(2, 2)], noisy_output,
+        workers=1, render_rgb=True, border_error_percent=100,
+    )
+    assert noisy_metrics.border_error_tiles["2x2"] == {"eligible": 2, "swapped": 2}
+    with rasterio.open(noisy_output / "mask_tile_grid_2x2.tif") as source:
+        np.testing.assert_array_equal(source.read(1), [[1, 1, 2], [0, 0, 2]])
+    with rasterio.open(noisy_output / "mask_tile_grid_2x2_border_error.tif") as source:
+        np.testing.assert_array_equal(source.read(1), [[1, 2, 1], [0, 0, 2]])
+        assert source.transform == Affine(2, 0, 10, 0, 2, 20)
+    assert (noisy_output / "mask_tile_2x2_preview_multicolor_border_error.png").is_file()
+    manifest = json.loads((noisy_output / "manifest.json").read_text())
+    assert manifest["outputs"]["tile_grid_border_error_masks"]["2x2"] == (
+        "mask_tile_grid_2x2_border_error.tif"
+    )

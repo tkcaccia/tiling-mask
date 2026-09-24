@@ -44,6 +44,10 @@ def make_parser() -> argparse.ArgumentParser:
                         help="Approximate aggregation working-set size (default: 64)")
     parser.add_argument("--workers", "-j", type=int, default=4,
                         help="Parallel output workers (default: 4; use 1 for sequential execution)")
+    parser.add_argument("--border-error-percent", type=float, default=0,
+                        help="Percentage of eligible tissue-boundary tiles to relabel; writes additional masks (default: 0)")
+    parser.add_argument("--border-error-seed", type=int, default=0,
+                        help="Reproducible boundary-tile selection seed (default: 0)")
     parser.add_argument("--render-rgb", action="store_true",
                         help="Write standard PNG previews, including distinct multicolor versions (default: off)")
     parser.add_argument("--render-full-rgb", action="store_true",
@@ -67,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
             compression=compression,
             chunk_megapixels=args.chunk_megapixels,
             workers=args.workers,
+            border_error_percent=args.border_error_percent,
+            border_error_seed=args.border_error_seed,
             render_rgb=args.render_rgb or args.render_full_rgb,
             render_full_rgb=args.render_full_rgb,
         )

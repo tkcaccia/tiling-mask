@@ -59,6 +59,26 @@ RGB triples. Open a `*_multicolor_cpp.png` file for a quick visual check. The
 tile TIFF is a compact grid, not a full-size image with tile colors expanded
 back across the original pixels.
 
+### Optional border-label error
+
+To simulate annotation errors at a boundary between two tissue segments, add:
+
+```bash
+--border-error-percent 10 --border-error-seed 42
+```
+
+This writes an **additional** tile TIFF for each size, such as
+`mask_tile_grid_28x28_border_error_cpp.tif`. The clean tile TIFF and pixel mask
+remain unchanged. A border tile is a non-background tile with at least one
+up/down/left/right neighbor assigned to a different non-background class. The
+selected percentage of eligible tiles is relabeled to an adjacent class (the
+lowest class ID when several qualify). The count is rounded to the nearest
+whole tile; selection is repeatable with the same seed. Background boundaries
+are excluded. With `--render-rgb`, the corresponding readable preview is
+`mask_tile_28x28_preview_multicolor_border_error_cpp.png`. The default is 0%,
+which creates no error-injected files. Eligible and swapped counts appear in
+`metrics_cpp.json`.
+
 The C++ input currently supports image-*pixel* coordinates in GeoJSON
 `Polygon` and `MultiPolygon` features, with up to 255 foreground classes. It
 reads class names from `classification.name` (QuPath), then `class`, `label`,
@@ -98,6 +118,8 @@ Its outputs are `mask_pixel.tif`, `mask_tile_grid_<WIDTH>x<HEIGHT>.tif`,
 `--coordinates world` for GeoJSON in the TIFF's geospatial reference system.
 The Python CLI also accepts `--class-property`, `--chunk-megapixels`,
 `--compression`, and `--render-full-rgb`; run `tiling-mask --help` for details.
+It also supports `--border-error-percent` and `--border-error-seed`, writing
+`mask_tile_grid_<WIDTH>x<HEIGHT>_border_error.tif` alongside each clean grid.
 
 Run the Python tests with:
 

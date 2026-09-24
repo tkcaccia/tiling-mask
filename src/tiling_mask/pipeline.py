@@ -15,6 +15,7 @@ from typing import Iterable
 import numpy as np
 
 from .annotations import ClassInfo, load_geojson
+from .border_error import swap_border_tiles
 from .majority import majority_tiles
 
 
@@ -37,6 +38,9 @@ class RunMetrics:
     workers: int
     render_rgb: bool
     render_full_rgb: bool
+    border_error_percent: float
+    border_error_seed: int
+    border_error_tiles: dict[str, dict[str, int]]
     rasterize_seconds: float
     pixel_tiff_seconds: float
     tile_tiff_seconds: dict[str, float]
@@ -186,7 +190,9 @@ def _write_tile_tiff(
     ignore_background: bool,
     dtype: str,
     render_full_rgb: bool,
-) -> None:
+    border_error_percent: float,
+    border_error_seed: int,
+) -> tuple[int, int]:
     import rasterio
     from affine import Affine
 
@@ -203,7 +209,8 @@ def _write_tile_tiff(
     tile_pixels = size.width * size.height
     tile_rows_per_chunk = max(1, int(chunk_megapixels * 1_000_000 / max(1, tile_pixels * cols)))
     preview_labels = (
-        np.empty((rows, cols), dtype=dtype) if preview_paths is not None else None
+        np.empty((rows, cols), dtype=dtype)
+        if preview_paths is not None or border_error_percent > 0 else None
     )
 
     with ExitStack() as stack:
@@ -253,6 +260,25 @@ def _write_tile_tiff(
                 preview_path, preview_labels, classes, distinct=index == 1
             )
 
+    if border_error_percent > 0 and preview_labels is not None:
+        noisy, eligible, swapped = swap_border_tiles(
+            preview_labels, border_error_percent, border_error_seed
+        )
+        noisy_path = path.with_name(path.stem + "_border_error.tif")
+        with rasterio.open(noisy_path, "w", **profile) as destination:
+            destination.write(noisy, 1)
+            _write_colormap(destination, classes)
+        if preview_paths is not None:
+            for index, preview_path in enumerate(preview_paths):
+                noisy_preview = preview_path.with_name(
+                    preview_path.stem + "_border_error.png"
+                )
+                _write_preview_png(
+                    noisy_preview, noisy, classes, distinct=index == 1
+                )
+        return eligible, swapped
+    return 0, 0
+
 
 def _pixel_job(
     temporary_name: str,
@@ -292,12 +318,14 @@ def _tile_job(
     chunk_megapixels: float,
     ignore_background: bool,
     render_full_rgb: bool,
-) -> tuple[str, float]:
+    border_error_percent: float,
+    border_error_seed: int,
+) -> tuple[str, float, int, int]:
     """Aggregate and write one tile size in a worker process."""
     started = time.perf_counter()
     mask = np.memmap(temporary_name, mode="r", dtype=dtype, shape=shape)
     try:
-        _write_tile_tiff(
+        eligible, swapped = _write_tile_tiff(
             path,
             full_rgb_paths,
             preview_paths,
@@ -311,10 +339,12 @@ def _tile_job(
             ignore_background,
             dtype,
             render_full_rgb,
+            border_error_percent,
+            border_error_seed,
         )
     finally:
         del mask
-    return size.slug, time.perf_counter() - started
+    return size.slug, time.perf_counter() - started, eligible, swapped
 
 
 def build_masks(
@@ -332,6 +362,8 @@ def build_masks(
     workers: int = 4,
     render_rgb: bool = False,
     render_full_rgb: bool = False,
+    border_error_percent: float = 0,
+    border_error_seed: int = 0,
 ) -> RunMetrics:
     """Create a pixel mask and one categorical TIFF per tile size."""
     import rasterio
@@ -350,6 +382,10 @@ def build_masks(
         raise ValueError("chunk_megapixels must be positive")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if not math.isfinite(border_error_percent) or not 0 <= border_error_percent <= 100:
+        raise ValueError("border_error_percent must be between 0 and 100")
+    if border_error_seed < 0 or border_error_seed > 2**64 - 1:
+        raise ValueError("border_error_seed must be a nonnegative 64-bit integer")
 
     annotations = load_geojson(geojson_path, class_property)
     dtype = "uint8" if len(annotations.classes) <= 256 else "uint16"
@@ -382,6 +418,7 @@ def build_masks(
         output_started = time.perf_counter()
         pixel_seconds = 0.0
         tile_seconds: dict[str, float] = {}
+        border_counts: dict[str, dict[str, int]] = {}
         shape = (height, width)
         pixel_args = (
             temporary_name,
@@ -418,6 +455,8 @@ def build_masks(
                 chunk_megapixels,
                 ignore_background,
                 render_full_rgb,
+                border_error_percent,
+                border_error_seed,
             )
             for size in sizes
         ]
@@ -425,19 +464,24 @@ def build_masks(
         if workers == 1:
             _, pixel_seconds = _pixel_job(*pixel_args)
             for args in tile_args:
-                slug, elapsed = _tile_job(*args)
+                slug, elapsed, eligible, swapped = _tile_job(*args)
                 tile_seconds[slug] = elapsed
+                border_counts[slug] = {"eligible": eligible, "swapped": swapped}
         else:
             job_count = 1 + len(tile_args)
             with ProcessPoolExecutor(max_workers=min(workers, job_count)) as executor:
                 futures = [executor.submit(_pixel_job, *pixel_args)]
                 futures.extend(executor.submit(_tile_job, *args) for args in tile_args)
                 for future in as_completed(futures):
-                    name, elapsed = future.result()
+                    result = future.result()
+                    name, elapsed = result[:2]
                     if name == "pixel":
                         pixel_seconds = elapsed
                     else:
                         tile_seconds[name] = elapsed
+                        border_counts[name] = {
+                            "eligible": result[2], "swapped": result[3]
+                        }
         output_wall_seconds = time.perf_counter() - output_started
 
         manifest = {
@@ -447,6 +491,8 @@ def build_masks(
             "workers": workers,
             "render_rgb": render_rgb,
             "render_full_rgb": render_full_rgb,
+            "border_error_percent": border_error_percent,
+            "border_error_seed": border_error_seed,
             "tile_sizes": [asdict(size) for size in sizes],
             "classes": [asdict(item) for item in annotations.classes],
             "outputs": {
@@ -456,6 +502,16 @@ def build_masks(
                 },
             },
         }
+        if border_error_percent > 0:
+            manifest["outputs"]["tile_grid_border_error_masks"] = {
+                size.slug: f"mask_tile_grid_{size.slug}_border_error.tif"
+                for size in sizes
+            }
+            if render_rgb:
+                manifest["outputs"]["tile_border_error_previews_multicolor_rgb"] = {
+                    size.slug: f"mask_tile_{size.slug}_preview_multicolor_border_error.png"
+                    for size in sizes
+                }
         if render_rgb:
             manifest["outputs"].update({
                 "pixel_preview": pixel_preview_path.name,
@@ -492,6 +548,9 @@ def build_masks(
             workers=workers,
             render_rgb=render_rgb,
             render_full_rgb=render_full_rgb,
+            border_error_percent=border_error_percent,
+            border_error_seed=border_error_seed,
+            border_error_tiles={size.slug: border_counts[size.slug] for size in sizes},
             rasterize_seconds=raster_seconds,
             pixel_tiff_seconds=pixel_seconds,
             tile_tiff_seconds={size.slug: tile_seconds[size.slug] for size in sizes},

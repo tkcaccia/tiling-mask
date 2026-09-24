@@ -38,3 +38,10 @@ MultiPolygon annotations and up to 255 foreground classes. Set
 `TILING_MASK_GDAL=/absolute/path/to/libgdal` if GDAL is not in the bundled
 Rasterio or Homebrew locations. A native scanline fallback remains available,
 but GDAL is required for exact parity on complex shared polygon boundaries.
+
+Use `--border-error-percent 10 --border-error-seed 42` to create additional
+tile-grid TIFFs with 10% of eligible tissue-boundary tiles assigned to an
+adjacent tissue class. Eligibility uses four-connected neighbors in the clean
+tile grid and excludes background. The clean masks stay intact. With
+`--render-rgb`, extra multicolor PNG previews are written too; counts are
+recorded in `metrics_cpp.json`. The default is 0%, so no extra files are made.

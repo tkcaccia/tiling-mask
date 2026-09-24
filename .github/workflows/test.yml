@@ -9,9 +9,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
       - run: sudo apt-get update && sudo apt-get install -y libomp-dev libtiff-dev libpng-dev libsimdjson-dev
       - run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build cpp/build --parallel 4
+      - run: python -m pip install -e '.[test]'
+      - run: pytest tests/test_cpp_border_error.py
 
   pytest:
     runs-on: ubuntu-latest

@@ -55,6 +55,7 @@ struct TileResult {
     TileSize size;
     int width{}, height{};
     std::vector<uint8_t> labels;
+    size_t border_eligible{}, border_swapped{};
     double seconds{};
 };
 
@@ -65,6 +66,8 @@ struct Options {
     int raster_workers = 4;
     int raster_chunk_rows = 0;
     bool render_previews = false;
+    double border_error_percent = 0;
+    uint64_t border_error_seed = 0;
 };
 
 class MappedFile {
@@ -640,6 +643,56 @@ static TileResult majority_grid(const uint8_t* mask, int width, int height,
     return result;
 }
 
+static uint64_t splitmix64(uint64_t value) {
+    value += 0x9E3779B97F4A7C15ULL;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+static std::vector<uint8_t> swap_border_tiles(TileResult& result, double percent,
+                                              uint64_t seed) {
+    std::vector<uint8_t> changed = result.labels;
+    if (percent == 0) return changed;
+    std::vector<uint8_t> alternate(changed.size());
+    std::vector<std::pair<uint64_t, size_t>> candidates;
+    for (int y = 0; y < result.height; ++y) {
+        for (int x = 0; x < result.width; ++x) {
+            size_t index = static_cast<size_t>(y) * result.width + x;
+            uint8_t current = result.labels[index];
+            if (current == 0) continue;
+            uint8_t target = 0;
+            auto consider = [&](int nx, int ny) {
+                if (nx < 0 || nx >= result.width || ny < 0 || ny >= result.height) return;
+                uint8_t neighbor = result.labels[static_cast<size_t>(ny) * result.width + nx];
+                if (neighbor != 0 && neighbor != current && (target == 0 || neighbor < target))
+                    target = neighbor;
+            };
+            consider(x - 1, y);
+            consider(x + 1, y);
+            consider(x, y - 1);
+            consider(x, y + 1);
+            if (target != 0) {
+                alternate[index] = target;
+                candidates.emplace_back(splitmix64(static_cast<uint64_t>(index) + seed), index);
+            }
+        }
+    }
+    result.border_eligible = candidates.size();
+    result.border_swapped = std::min(candidates.size(),
+        static_cast<size_t>(std::floor(candidates.size() * percent / 100.0 + 0.5)));
+    if (result.border_swapped == 0) return changed;
+    if (result.border_swapped < candidates.size()) {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first ||
+                   (left.first == right.first && left.second < right.second);
+        });
+    }
+    for (size_t i = 0; i < result.border_swapped; ++i)
+        changed[candidates[i].second] = alternate[candidates[i].second];
+    return changed;
+}
+
 static std::pair<int, int> image_dimensions(const fs::path& path) {
     TIFF* tif = TIFFOpen(path.c_str(), "r");
     if (!tif) throw std::runtime_error("cannot open image TIFF: " + path.string());
@@ -662,7 +715,8 @@ static Options parse_args(int argc, char** argv) {
     if (argc < 4) {
         throw std::runtime_error(
             "usage: tiling-mask-cpp IMAGE GEOJSON --output DIR --tile-size N [...] "
-            "[--workers 4] [--raster-workers 4] [--render-rgb]");
+            "[--workers 4] [--raster-workers 4] [--render-rgb] "
+            "[--border-error-percent 0] [--border-error-seed 0]");
     }
     Options options;
     options.image = argv[1]; options.geojson = argv[2];
@@ -674,12 +728,20 @@ static Options parse_args(int argc, char** argv) {
         else if (arg == "--raster-workers" && i + 1 < argc) options.raster_workers = std::stoi(argv[++i]);
         else if (arg == "--raster-chunk-rows" && i + 1 < argc) options.raster_chunk_rows = std::stoi(argv[++i]);
         else if (arg == "--render-rgb") options.render_previews = true;
+        else if (arg == "--border-error-percent" && i + 1 < argc) options.border_error_percent = std::stod(argv[++i]);
+        else if (arg == "--border-error-seed" && i + 1 < argc) {
+            std::string value = argv[++i];
+            if (value.empty() || value.front() == '-') throw std::runtime_error("border error seed must be nonnegative");
+            options.border_error_seed = std::stoull(value);
+        }
         else throw std::runtime_error("unknown or incomplete argument: " + arg);
     }
     if (options.output.empty() || options.tiles.empty()) throw std::runtime_error("--output and --tile-size are required");
     if (options.workers <= 0) throw std::runtime_error("workers must be positive");
     if (options.raster_workers <= 0) throw std::runtime_error("raster workers must be positive");
     if (options.raster_chunk_rows < 0) throw std::runtime_error("raster chunk rows must be nonnegative");
+    if (!std::isfinite(options.border_error_percent) || options.border_error_percent < 0 ||
+        options.border_error_percent > 100) throw std::runtime_error("border error percent must be between 0 and 100");
     return options;
 }
 
@@ -693,6 +755,8 @@ static void write_manifest(const Options& options, int width, int height,
         << "\",\n  \"width\": " << width
         << ",\n  \"height\": " << height << ",\n  \"workers\": " << options.workers
         << ",\n  \"raster_workers\": " << options.raster_workers
+        << ",\n  \"border_error_percent\": " << options.border_error_percent
+        << ",\n  \"border_error_seed\": " << options.border_error_seed
         << ",\n  \"render_rgb\": " << (options.render_previews ? "true" : "false")
         << ",\n  \"rasterize_seconds\": " << raster_seconds
         << ",\n  \"output_wall_seconds\": " << output_seconds
@@ -703,6 +767,13 @@ static void write_manifest(const Options& options, int width, int height,
     for (size_t i = 0; i < results.size(); ++i) {
         if (i) out << ',';
         out << "\n    \"" << results[i].size.slug() << "\": " << results[i].seconds;
+    }
+    out << "\n  },\n  \"border_error_tiles\": {";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out << ',';
+        out << "\n    \"" << results[i].size.slug() << "\": {\"eligible\": "
+            << results[i].border_eligible << ", \"swapped\": "
+            << results[i].border_swapped << '}';
     }
     out << "\n  },\n  \"classes\": [";
     for (size_t i = 0; i < classes.size(); ++i) {
@@ -769,6 +840,14 @@ int main(int argc, char** argv) {
                         if (options.render_previews) {
                             write_png(options.output / ("mask_tile_" + slug + "_preview_cpp.png"), result.labels.data(), result.width, result.height, classes, false);
                             write_png(options.output / ("mask_tile_" + slug + "_preview_multicolor_cpp.png"), result.labels.data(), result.width, result.height, classes, true);
+                        }
+                        if (options.border_error_percent > 0) {
+                            auto changed = swap_border_tiles(result, options.border_error_percent, options.border_error_seed);
+                            write_tiff(options.output / ("mask_tile_grid_" + slug + "_border_error_cpp.tif"), changed.data(), result.width, result.height, classes);
+                            if (options.render_previews) {
+                                write_png(options.output / ("mask_tile_" + slug + "_preview_border_error_cpp.png"), changed.data(), result.width, result.height, classes, false);
+                                write_png(options.output / ("mask_tile_" + slug + "_preview_multicolor_border_error_cpp.png"), changed.data(), result.width, result.height, classes, true);
+                            }
                         }
                         result.seconds = seconds_since(task_start);
                         results[index] = std::move(result);
