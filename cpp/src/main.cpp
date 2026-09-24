@@ -244,12 +244,15 @@ static std::pair<std::vector<Feature>, std::vector<ClassInfo>> load_geojson(cons
         simdjson::dom::object geometry;
         if (feature_element["geometry"].get(geometry)) continue;
         std::string_view type;
+        simdjson::dom::element coordinates_element;
         simdjson::dom::array coordinates;
-        if (geometry["type"].get(type) || geometry["coordinates"].get(coordinates)) continue;
+        if (geometry["type"].get(type) ||
+            geometry["coordinates"].get(coordinates_element) ||
+            coordinates_element.get(coordinates)) continue;
         Feature feature;
         feature.class_id = class_id;
         if (type == "Polygon") {
-            Polygon polygon = parse_polygon(coordinates);
+            Polygon polygon = parse_polygon(coordinates_element);
             if (!polygon.empty()) feature.polygons.push_back(std::move(polygon));
         } else if (type == "MultiPolygon") {
             feature.polygons.reserve(coordinates.size());
