@@ -1,9 +1,11 @@
 # tiling-mask
 
 Turn GeoJSON polygon annotations for a large OME-TIFF into a pixel-level class
-mask and one or more majority-vote tile masks. The fast C++ backend is the
-recommended CLI. It reads the image dimensions without decoding image pixels,
-rasterizes the annotations, and writes compact indexed-color TIFFs.
+mask and one or more majority-vote tile masks. Optionally generate separate,
+reproducible masks with a chosen percentage of tissue-boundary tiles assigned
+to an adjacent class. The fast C++ backend is the recommended CLI. It reads
+image dimensions without decoding image pixels, rasterizes the annotations,
+and writes compact indexed-color TIFFs.
 
 For each requested tile size, one output pixel represents one tile of the
 original image. Its class is the most common pixel-mask class in that tile.
