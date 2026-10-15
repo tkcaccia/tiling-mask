@@ -1,11 +1,12 @@
 # tiling-mask
 
-Turn GeoJSON polygon annotations for a large OME-TIFF into a pixel-level class
-mask and one or more majority-vote tile masks. Optionally generate separate,
-reproducible masks with a chosen percentage of tissue-boundary tiles assigned
-to an adjacent class. The fast C++ backend is the recommended CLI. It reads
-image dimensions without decoding image pixels, rasterizes the annotations,
-and writes compact indexed-color TIFFs.
+Turn either an OME-TIFF plus GeoJSON polygons **or an existing pixel-level
+categorical mask alone** into one or more majority-vote tile masks. Optionally
+generate separate, reproducible masks with a chosen percentage of
+tissue-boundary tiles assigned to an adjacent class. The fast C++ backend is
+the recommended CLI. In GeoJSON mode it reads the original image dimensions
+without decoding its pixels; in mask mode it reads the supplied class mask.
+Both modes write compact indexed-color TIFFs.
 
 For each requested tile size, one output pixel represents one tile of the
 original image. Its class is the most common pixel-mask class in that tile.
@@ -26,11 +27,46 @@ cmake --build cpp/build --parallel 4
 
 The program uses GDAL at runtime for exact polygon boundaries. By default it
 looks for the GDAL library supplied by Rasterio's Python 3.12 macOS wheel or
-Homebrew. If yours is elsewhere, set `TILING_MASK_GDAL` to the absolute path of
-the GDAL shared library. Without GDAL, the native scanline rasterizer is used;
-its results can differ at polygon boundaries.
+Homebrew on macOS, and the system `libgdal.so` on Linux. If yours is elsewhere,
+set `TILING_MASK_GDAL` to the absolute path of the GDAL shared library.
+Without GDAL, the native scanline rasterizer is used; its results can differ
+at polygon boundaries. Check `metrics_cpp.json` for `"rasterizer": "gdal"`.
+
+On Ubuntu where distribution packages provide simdjson 3.x and you have
+package-install privileges:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libomp-dev libtiff-dev \
+  libpng-dev libsimdjson-dev libgdal-dev
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build --parallel 4
+```
+
+On Ubuntu 22.04, the stock simdjson package is 1.0.2; the verified setup uses
+simdjson 3.0.1 instead. If you do not have `sudo` and simdjson is the only
+missing library, build it under your own account and pass its prefix to CMake.
+See the
+[Linux installation notes](docs/linux-install.md).
 
 ## Run
+
+From an existing categorical mask, supply only `--mask` and tile sizes:
+
+```bash
+cpp/build/tiling-mask-cpp --mask pixel_mask.tif \
+  --tile-size 28 --tile-size 56 --tile-size 90 --tile-size 224 \
+  --workers 4 --render-rgb --output output
+```
+
+The C++ mask input must be a single-band, 8-bit categorical TIFF (stripped or
+tiled), with class IDs as pixel values and 0 as background. It preserves those
+IDs and any TIFF color map; otherwise it assigns distinct visible colors.
+RGB images and 16-bit masks are not accepted by the C++ mask-input mode.
+The original image and GeoJSON are not read. `--raster-workers` has no effect
+in this mode.
+
+The original GeoJSON workflow remains available:
 
 ```bash
 cpp/build/tiling-mask-cpp image.ome.tif annotations.geojson \
@@ -59,7 +95,8 @@ The output directory contains:
 The TIFFs use a color palette, but their pixel values are **class IDs**, not
 RGB triples. Open a `*_multicolor_cpp.png` file for a quick visual check. The
 tile TIFF is a compact grid, not a full-size image with tile colors expanded
-back across the original pixels.
+back across the original pixels. In mask-input mode, `mask_pixel_cpp.tif` is a
+normalized copy of the supplied pixel mask.
 
 ### Optional border-label error
 
@@ -122,6 +159,11 @@ The Python CLI also accepts `--class-property`, `--chunk-megapixels`,
 `--compression`, and `--render-full-rgb`; run `tiling-mask --help` for details.
 It also supports `--border-error-percent` and `--border-error-seed`, writing
 `mask_tile_grid_<WIDTH>x<HEIGHT>_border_error.tif` alongside each clean grid.
+To use an existing mask instead, run
+`tiling-mask --mask pixel_mask.tif -t 28 -o output_python`. Python accepts any
+Rasterio-readable single-band uint8 categorical mask, including TIFF and PNG;
+it keeps its affine transform, CRS, color map, and `CLASS_NAMES` band tag when
+present. GeoJSON-only options do not apply in mask-input mode.
 
 Run the Python tests with:
 

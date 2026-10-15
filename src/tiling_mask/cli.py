@@ -26,10 +26,12 @@ def _tile_size(value: str) -> TileSize:
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tiling-mask",
-        description="Rasterize GeoJSON annotations and aggregate them by majority class.",
+        description="Create majority-class tile masks from GeoJSON annotations or a categorical pixel mask.",
     )
-    parser.add_argument("image", type=Path, help="OME-TIFF reference image")
-    parser.add_argument("annotations", type=Path, help="GeoJSON annotation file")
+    parser.add_argument("image", nargs="?", type=Path, help="OME-TIFF reference image (GeoJSON mode)")
+    parser.add_argument("annotations", nargs="?", type=Path, help="GeoJSON annotation file (GeoJSON mode)")
+    parser.add_argument("--mask", type=Path,
+                        help="Use a single-band uint8 categorical pixel mask instead of IMAGE and GEOJSON")
     parser.add_argument("--tile-size", "-t", action="append", type=_tile_size, required=True,
                         help="Repeatable tile size: N or WIDTHxHEIGHT")
     parser.add_argument("--output", "-o", type=Path, required=True, help="Output directory")
@@ -56,7 +58,12 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = make_parser().parse_args(argv)
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    if args.mask is None and (args.image is None or args.annotations is None):
+        parser.error("provide IMAGE and GEOJSON, or use --mask MASK alone")
+    if args.mask is not None and (args.image is not None or args.annotations is not None):
+        parser.error("--mask cannot be combined with IMAGE or GEOJSON")
     compression = None if args.compression == "none" else args.compression
     try:
         metrics = build_masks(
@@ -64,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             args.annotations,
             args.tile_size,
             args.output,
+            mask_path=args.mask,
             class_property=args.class_property,
             coordinates=args.coordinates,
             all_touched=args.all_touched,

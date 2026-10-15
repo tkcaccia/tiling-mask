@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tiling-mask"
 version = "0.1.0"
-description = "Fast conversion of GeoJSON annotations into pixel- and tile-resolution TIFF masks."
+description = "Fast majority-tile masks from GeoJSON annotations or categorical pixel masks."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

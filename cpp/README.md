@@ -15,6 +15,12 @@ cmake -S cpp -B cpp/build \
 cmake --build cpp/build --parallel 4
 ```
 
+On Linux, install the corresponding distribution packages and build with the
+system C++ compiler. A verified user-local setup for machines without `sudo`
+is in [docs/linux-install.md](../docs/linux-install.md). Linux loads the system
+`libgdal.so` automatically when available; confirm `"rasterizer": "gdal"` in
+`metrics_cpp.json` after running.
+
 Run:
 
 ```bash
@@ -22,6 +28,18 @@ cpp/build/tiling-mask-cpp image.ome.tif annotations.geojson \
   -t 28 -t 56 -t 90 -t 224 \
   -j 4 --raster-workers 4 --render-rgb -o output_cpp
 ```
+
+Or use just an existing pixel-level categorical mask:
+
+```bash
+cpp/build/tiling-mask-cpp --mask pixel_mask.tif \
+  -t 28 -t 56 -t 90 -t 224 -j 4 --render-rgb -o output_cpp
+```
+
+The mask must be a single-band uint8 TIFF; both stripped and tiled layouts are
+read in bounded buffers. Class IDs and a TIFF color map are preserved. The
+tool writes a normalized pixel TIFF plus the tile grids, previews, and optional
+border-error grids. The original image and GeoJSON are not needed.
 
 `--raster-workers` divides the image into independent row stripes. Each worker
 uses its own GDAL dataset and geometry copies, then writes to a separate part

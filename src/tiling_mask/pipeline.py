@@ -31,6 +31,7 @@ class TileSize:
 
 @dataclass
 class RunMetrics:
+    input_mode: str
     width: int
     height: int
     features: int
@@ -101,6 +102,21 @@ def _distinct_rgb_lookup(classes: list[ClassInfo]) -> np.ndarray:
         rgb = colorsys.hsv_to_rgb(hue, 0.78, 0.95)
         lookup[item.value] = np.rint(np.asarray(rgb) * 255).astype(np.uint8)
     return lookup
+
+
+def _classes_from_mask(
+    highest: int, palette: dict[int, tuple[int, ...]], names: dict[str, str]
+) -> list[ClassInfo]:
+    classes = [ClassInfo(0, names.get("0", "background"), (0, 0, 0, 0))]
+    for value in range(1, highest + 1):
+        if value in palette:
+            color = tuple(palette[value][:3]) + (255,)
+        else:
+            hue = (value * 0.618033988749895) % 1.0
+            rgb = colorsys.hsv_to_rgb(hue, 0.78, 0.95)
+            color = tuple(int(round(channel * 255)) for channel in rgb) + (255,)
+        classes.append(ClassInfo(value, names.get(str(value), f"class_{value}"), color))
+    return classes
 
 
 def _write_colormap(dataset, classes: list[ClassInfo]) -> None:
@@ -348,10 +364,10 @@ def _tile_job(
 
 
 def build_masks(
-    image_path: str | Path,
-    geojson_path: str | Path,
-    tile_sizes: Iterable[TileSize],
-    output_dir: str | Path,
+    image_path: str | Path | None = None,
+    geojson_path: str | Path | None = None,
+    tile_sizes: Iterable[TileSize] | None = None,
+    output_dir: str | Path | None = None,
     *,
     class_property: str | None = None,
     coordinates: str = "pixel",
@@ -364,16 +380,20 @@ def build_masks(
     render_full_rgb: bool = False,
     border_error_percent: float = 0,
     border_error_seed: int = 0,
+    mask_path: str | Path | None = None,
 ) -> RunMetrics:
-    """Create a pixel mask and one categorical TIFF per tile size."""
+    """Create a pixel mask and tile TIFFs from GeoJSON or an input label mask."""
     import rasterio
     from affine import Affine
     from rasterio.features import rasterize
+    from rasterio.windows import Window
 
     started = time.perf_counter()
+    if output_dir is None:
+        raise ValueError("output_dir is required")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    sizes = list(tile_sizes)
+    sizes = list(tile_sizes) if tile_sizes is not None else []
     if not sizes:
         raise ValueError("At least one tile size is required")
     if coordinates not in {"pixel", "world"}:
@@ -386,27 +406,68 @@ def build_masks(
         raise ValueError("border_error_percent must be between 0 and 100")
     if border_error_seed < 0 or border_error_seed > 2**64 - 1:
         raise ValueError("border_error_seed must be a nonnegative 64-bit integer")
-
-    annotations = load_geojson(geojson_path, class_property)
-    dtype = "uint8" if len(annotations.classes) <= 256 else "uint16"
-    with rasterio.open(image_path) as source:
-        width, height = source.width, source.height
-        source_transform, crs = source.transform, source.crs
+    if mask_path is None:
+        if image_path is None or geojson_path is None:
+            raise ValueError("provide image and GeoJSON paths, or mask_path alone")
+        annotations = load_geojson(geojson_path, class_property)
+        classes = annotations.classes
+        dtype = "uint8" if len(classes) <= 256 else "uint16"
+        with rasterio.open(image_path) as source:
+            width, height = source.width, source.height
+            source_transform, crs = source.transform, source.crs
+        palette: dict[int, tuple[int, ...]] = {}
+        names: dict[str, str] = {}
+    else:
+        if image_path is not None or geojson_path is not None:
+            raise ValueError("mask_path cannot be combined with image or GeoJSON paths")
+        if class_property is not None or coordinates != "pixel" or all_touched:
+            raise ValueError("GeoJSON-only options cannot be used with mask_path")
+        annotations = None
+        dtype = "uint8"
+        with rasterio.open(mask_path) as source:
+            if source.count != 1 or source.dtypes[0] != dtype:
+                raise ValueError("input mask must be single-band uint8 categorical data (not RGB)")
+            if source.nodata not in (None, 0):
+                raise ValueError("input mask nodata must be 0 or unset")
+            width, height = source.width, source.height
+            source_transform, crs = source.transform, source.crs
+            try:
+                palette = source.colormap(1)
+            except ValueError:
+                palette = {}
+            names_tag = source.tags(1).get("CLASS_NAMES")
+            try:
+                names = json.loads(names_tag) if names_tag else {}
+            except (TypeError, ValueError):
+                names = {}
+            if not isinstance(names, dict):
+                names = {}
 
     fd, temporary_name = tempfile.mkstemp(prefix="tiling-mask-", suffix=".bin", dir=output)
     os.close(fd)
     mask = np.memmap(temporary_name, mode="w+", dtype=dtype, shape=(height, width))
     try:
         raster_started = time.perf_counter()
-        burn_transform = Affine.identity() if coordinates == "pixel" else source_transform
-        rasterize(
-            annotations.shapes,
-            out=mask,
-            transform=burn_transform,
-            fill=0,
-            all_touched=all_touched,
-            dtype=dtype,
-        )
+        if mask_path is None:
+            burn_transform = Affine.identity() if coordinates == "pixel" else source_transform
+            rasterize(
+                annotations.shapes,
+                out=mask,
+                transform=burn_transform,
+                fill=0,
+                all_touched=all_touched,
+                dtype=dtype,
+            )
+        else:
+            highest = 0
+            rows_per_chunk = max(1, 64_000_000 // width)
+            with rasterio.open(mask_path) as source:
+                for row in range(0, height, rows_per_chunk):
+                    end = min(height, row + rows_per_chunk)
+                    destination = mask[row:end, :]
+                    source.read(1, window=Window(0, row, width, end - row), out=destination)
+                    highest = max(highest, int(destination.max(initial=0)))
+            classes = _classes_from_mask(highest, palette, names)
         mask.flush()
         raster_seconds = time.perf_counter() - raster_started
 
@@ -431,7 +492,7 @@ def build_masks(
             _rgb_profile(width, height, source_transform, crs, compression)
             if render_full_rgb
             else None,
-            annotations.classes,
+            classes,
         )
         tile_args = [
             (
@@ -451,7 +512,7 @@ def build_masks(
                 source_transform,
                 crs,
                 compression,
-                annotations.classes,
+                classes,
                 chunk_megapixels,
                 ignore_background,
                 render_full_rgb,
@@ -485,8 +546,7 @@ def build_masks(
         output_wall_seconds = time.perf_counter() - output_started
 
         manifest = {
-            "source_image": str(Path(image_path).resolve()),
-            "source_annotations": str(Path(geojson_path).resolve()),
+            "input_mode": "mask" if mask_path is not None else "geojson",
             "coordinates": coordinates,
             "workers": workers,
             "render_rgb": render_rgb,
@@ -494,7 +554,7 @@ def build_masks(
             "border_error_percent": border_error_percent,
             "border_error_seed": border_error_seed,
             "tile_sizes": [asdict(size) for size in sizes],
-            "classes": [asdict(item) for item in annotations.classes],
+            "classes": [asdict(item) for item in classes],
             "outputs": {
                 "pixel_mask": pixel_path.name,
                 "tile_grid_masks": {
@@ -502,6 +562,11 @@ def build_masks(
                 },
             },
         }
+        if mask_path is None:
+            manifest["source_image"] = str(Path(image_path).resolve())
+            manifest["source_annotations"] = str(Path(geojson_path).resolve())
+        else:
+            manifest["source_mask"] = str(Path(mask_path).resolve())
         if border_error_percent > 0:
             manifest["outputs"]["tile_grid_border_error_masks"] = {
                 size.slug: f"mask_tile_grid_{size.slug}_border_error.tif"
@@ -541,10 +606,11 @@ def build_masks(
 
         total = time.perf_counter() - started
         metrics = RunMetrics(
+            input_mode="mask" if mask_path is not None else "geojson",
             width=width,
             height=height,
-            features=len(annotations.shapes),
-            classes=len(annotations.classes) - 1,
+            features=len(annotations.shapes) if annotations is not None else 0,
+            classes=len(classes) - 1,
             workers=workers,
             render_rgb=render_rgb,
             render_full_rgb=render_full_rgb,

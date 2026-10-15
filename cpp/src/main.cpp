@@ -60,7 +60,7 @@ struct TileResult {
 };
 
 struct Options {
-    fs::path image, geojson, output;
+    fs::path image, geojson, mask_input, output;
     std::vector<TileSize> tiles;
     int workers = 4;
     int raster_workers = 4;
@@ -398,6 +398,16 @@ private:
 
 static fs::path find_gdal_library() {
     if (const char* configured = std::getenv("TILING_MASK_GDAL")) return configured;
+#if defined(__linux__)
+    // Resolve through the system loader so distro-specific lib directories work.
+    for (const char* name : {"libgdal.so", "libgdal.so.36", "libgdal.so.35",
+                             "libgdal.so.34", "libgdal.so.32", "libgdal.so.30"}) {
+        if (void* probe = dlopen(name, RTLD_LAZY | RTLD_LOCAL)) {
+            dlclose(probe);
+            return name;
+        }
+    }
+#endif
     const std::vector<fs::path> roots = {
         "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/rasterio/.dylibs",
         "/opt/homebrew/lib"
@@ -615,6 +625,80 @@ static void write_png(const fs::path& path, const uint8_t* data, int width, int 
     std::fclose(fp);
 }
 
+static std::vector<ClassInfo> read_mask_tiff(const fs::path& path, uint8_t* data,
+                                             int width, int height) {
+    TIFF* tif = TIFFOpen(path.c_str(), "r");
+    if (!tif) throw std::runtime_error("cannot open input mask TIFF: " + path.string());
+    try {
+        uint16_t bits{}, samples{}, sample_format{};
+        TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bits);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &samples);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &sample_format);
+        if (bits != 8 || samples != 1 || sample_format != SAMPLEFORMAT_UINT)
+            throw std::runtime_error("input mask must be a single-band 8-bit categorical TIFF (not RGB)");
+
+        if (TIFFIsTiled(tif)) {
+            uint32_t tile_width{}, tile_height{};
+            TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tile_width);
+            TIFFGetField(tif, TIFFTAG_TILELENGTH, &tile_height);
+            tmsize_t tile_bytes = TIFFTileSize(tif);
+            if (!tile_width || !tile_height || tile_bytes <= 0)
+                throw std::runtime_error("invalid input mask TIFF tile layout");
+            std::vector<uint8_t> tile(static_cast<size_t>(tile_bytes));
+            for (int y = 0; y < height; y += static_cast<int>(tile_height)) {
+                for (int x = 0; x < width; x += static_cast<int>(tile_width)) {
+                    ttile_t index = TIFFComputeTile(tif, x, y, 0, 0);
+                    if (TIFFReadEncodedTile(tif, index, tile.data(), tile_bytes) < 0)
+                        throw std::runtime_error("cannot decode input mask TIFF tile");
+                    int copy_width = std::min(static_cast<int>(tile_width), width - x);
+                    int copy_height = std::min(static_cast<int>(tile_height), height - y);
+                    for (int row = 0; row < copy_height; ++row)
+                        std::memcpy(data + static_cast<size_t>(y + row) * width + x,
+                                    tile.data() + static_cast<size_t>(row) * tile_width,
+                                    static_cast<size_t>(copy_width));
+                }
+            }
+        } else {
+            tmsize_t scanline_bytes = TIFFScanlineSize(tif);
+            if (scanline_bytes < width)
+                throw std::runtime_error("invalid input mask TIFF scanline layout");
+            std::vector<uint8_t> scanline(static_cast<size_t>(scanline_bytes));
+            for (int y = 0; y < height; ++y) {
+                if (TIFFReadScanline(tif, scanline.data(), static_cast<uint32_t>(y)) < 0)
+                    throw std::runtime_error("cannot decode input mask TIFF scanline");
+                std::memcpy(data + static_cast<size_t>(y) * width, scanline.data(),
+                            static_cast<size_t>(width));
+            }
+        }
+
+        auto pixel_count = static_cast<size_t>(width) * height;
+        uint8_t highest = *std::max_element(data, data + pixel_count);
+        uint16_t *red = nullptr, *green = nullptr, *blue = nullptr;
+        // GDAL may store a color map with MINISBLACK plus COLORINTERP metadata.
+        bool has_palette = TIFFGetField(tif, TIFFTAG_COLORMAP, &red, &green, &blue) &&
+                           red && green && blue;
+        std::vector<ClassInfo> classes;
+        classes.reserve(static_cast<size_t>(highest) + 1);
+        for (int id = 0; id <= highest; ++id) {
+            auto color = id == 0 ? std::array<uint8_t, 3>{0, 0, 0}
+                                 : has_palette
+                                     ? std::array<uint8_t, 3>{
+                                           static_cast<uint8_t>(red[id] / 257),
+                                           static_cast<uint8_t>(green[id] / 257),
+                                           static_cast<uint8_t>(blue[id] / 257)}
+                                     : distinct_color(static_cast<uint8_t>(id));
+            classes.push_back({static_cast<uint8_t>(id),
+                               id == 0 ? "background" : "class_" + std::to_string(id),
+                               color});
+        }
+        TIFFClose(tif);
+        return classes;
+    } catch (...) {
+        TIFFClose(tif);
+        throw;
+    }
+}
+
 static TileResult majority_grid(const uint8_t* mask, int width, int height,
                                 TileSize size, int class_count) {
     auto start = Clock::now();
@@ -700,6 +784,10 @@ static std::pair<int, int> image_dimensions(const fs::path& path) {
     TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width);
     TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
     TIFFClose(tif);
+    if (width == 0 || height == 0 ||
+        width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        height > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("input TIFF dimensions are invalid or too large");
     return {static_cast<int>(width), static_cast<int>(height)};
 }
 
@@ -712,17 +800,18 @@ static TileSize parse_tile(const std::string& text) {
 }
 
 static Options parse_args(int argc, char** argv) {
-    if (argc < 4) {
+    if (argc < 2) {
         throw std::runtime_error(
-            "usage: tiling-mask-cpp IMAGE GEOJSON --output DIR --tile-size N [...] "
+            "usage: tiling-mask-cpp [IMAGE GEOJSON | --mask MASK.tif] --output DIR --tile-size N [...] "
             "[--workers 4] [--raster-workers 4] [--render-rgb] "
             "[--border-error-percent 0] [--border-error-seed 0]");
     }
     Options options;
-    options.image = argv[1]; options.geojson = argv[2];
-    for (int i = 3; i < argc; ++i) {
+    std::vector<fs::path> positionals;
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "--output" || arg == "-o") && i + 1 < argc) options.output = argv[++i];
+        if (arg == "--mask" && i + 1 < argc) options.mask_input = argv[++i];
+        else if ((arg == "--output" || arg == "-o") && i + 1 < argc) options.output = argv[++i];
         else if ((arg == "--tile-size" || arg == "-t") && i + 1 < argc) options.tiles.push_back(parse_tile(argv[++i]));
         else if ((arg == "--workers" || arg == "-j") && i + 1 < argc) options.workers = std::stoi(argv[++i]);
         else if (arg == "--raster-workers" && i + 1 < argc) options.raster_workers = std::stoi(argv[++i]);
@@ -734,7 +823,16 @@ static Options parse_args(int argc, char** argv) {
             if (value.empty() || value.front() == '-') throw std::runtime_error("border error seed must be nonnegative");
             options.border_error_seed = std::stoull(value);
         }
+        else if (!arg.empty() && arg.front() != '-') positionals.push_back(arg);
         else throw std::runtime_error("unknown or incomplete argument: " + arg);
+    }
+    if (options.mask_input.empty()) {
+        if (positionals.size() != 2)
+            throw std::runtime_error("provide IMAGE and GEOJSON, or use --mask MASK.tif alone");
+        options.image = positionals[0];
+        options.geojson = positionals[1];
+    } else if (!positionals.empty()) {
+        throw std::runtime_error("--mask cannot be combined with IMAGE or GEOJSON");
     }
     if (options.output.empty() || options.tiles.empty()) throw std::runtime_error("--output and --tile-size are required");
     if (options.workers <= 0) throw std::runtime_error("workers must be positive");
@@ -752,6 +850,7 @@ static void write_manifest(const Options& options, int width, int height,
                            const std::vector<TileResult>& results) {
     std::ofstream out(options.output / "metrics_cpp.json");
     out << "{\n  \"backend\": \"cpp\",\n  \"rasterizer\": \"" << rasterizer
+        << "\",\n  \"input_mode\": \"" << (options.mask_input.empty() ? "geojson" : "mask")
         << "\",\n  \"width\": " << width
         << ",\n  \"height\": " << height << ",\n  \"workers\": " << options.workers
         << ",\n  \"raster_workers\": " << options.raster_workers
@@ -792,19 +891,23 @@ int main(int argc, char** argv) {
         Options options = parse_args(argc, argv);
         fs::create_directories(options.output);
         auto total_start = Clock::now();
-        auto dimensions = image_dimensions(options.image);
+        auto dimensions = image_dimensions(options.mask_input.empty() ? options.image : options.mask_input);
         int width = dimensions.first;
         int height = dimensions.second;
-        auto annotation_data = load_geojson(options.geojson);
-        auto& features = annotation_data.first;
-        auto& classes = annotation_data.second;
         MappedFile mapped(options.output / "mask_cpp.tmp", static_cast<size_t>(width) * height);
 
         auto raster_start = Clock::now();
-        std::string rasterizer = rasterize_features(
-            features, mapped.data(), width, height,
-            options.raster_chunk_rows, options.raster_workers
-        );
+        std::vector<ClassInfo> classes;
+        std::string rasterizer;
+        if (options.mask_input.empty()) {
+            auto annotation_data = load_geojson(options.geojson);
+            classes = std::move(annotation_data.second);
+            rasterizer = rasterize_features(annotation_data.first, mapped.data(), width, height,
+                                            options.raster_chunk_rows, options.raster_workers);
+        } else {
+            classes = read_mask_tiff(options.mask_input, mapped.data(), width, height);
+            rasterizer = "mask-input";
+        }
         double raster_seconds = seconds_since(raster_start);
 
         auto output_start = Clock::now();
